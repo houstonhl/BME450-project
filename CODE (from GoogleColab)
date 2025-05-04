@@ -1,0 +1,233 @@
+# Imports
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from torchvision.models import resnet18, ResNet18_Weights
+import shutil
+import random
+from pathlib import Path
+import matplotlib.pyplot as plt
+import os
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Directories/accessing data from Drive
+SOURCE_DIR = Path('/content/drive/MyDrive/dataset')  # Accessing Google Drive folder named "dataset" with classes 0-4 and corresponding images
+DEST_DIR = Path('/content/drive/MyDrive/split_dataset')  # New Drive folder where randomized training and validation data will go
+VAL_RATIO = 0.2  # 20% validation, 80% training
+
+if not os.path.exists(DEST_DIR): # Seeing if split_dataset exists or not (if it does, we don't want to duplicate the data)
+    print("Splitting dataset into train and val folders...")
+    SOURCE_DIR = Path('/content/drive/MyDrive/dataset')  
+    DEST_DIR = Path('/content/drive/MyDrive/split_dataset') 
+    VAL_RATIO = 0.2  # 20% validation
+
+    for split in ['train', 'val']:
+      for cls in range(5):  # classes 0 to 4
+        (DEST_DIR / split / str(cls)).mkdir(parents=True, exist_ok=True)
+
+# Splitting into training and validation data
+for cls in range(5):
+    class_path = SOURCE_DIR / str(cls)
+    images = list(class_path.glob('*'))
+    random.shuffle(images)
+
+    val_count = int(len(images) * VAL_RATIO)
+    val_images = images[:val_count]
+    train_images = images[val_count:]
+
+    for img_path in train_images:
+        shutil.copy(img_path, DEST_DIR / 'train' / str(cls) / img_path.name)
+    for img_path in val_images:
+        shutil.copy(img_path, DEST_DIR / 'val' / str(cls) / img_path.name)
+
+
+else:
+    print("Split dataset already exists. Skipping split.")
+
+
+# Training and validation directories with new randomly split data
+train_dir = DEST_DIR / 'train'
+val_dir = DEST_DIR / 'val'
+
+
+# Data augmentation
+transform_train = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+])
+
+transform_val = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+
+# Datasets and dataloaders
+train_dataset = datasets.ImageFolder(train_dir, transform=transform_train)
+val_dataset = datasets.ImageFolder(val_dir, transform=transform_val)
+
+dataloaders = {
+    'train': DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0),
+    'val': DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+}
+
+dataset_sizes = {'train': len(train_dataset), 'val': len(val_dataset)}
+class_names = train_dataset.classes
+num_classes = len(class_names)
+
+
+
+# Models
+
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes):
+        super(SimpleCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(64 * 28 * 28, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1) # flatten
+        x = self.classifier(x)
+        return x
+
+def initialize_model(arch, num_classes):
+    if arch == 'SimpleCNN':
+        model = SimpleCNN(num_classes)
+    elif arch == 'ResNet18':
+        model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_ftrs, num_classes)
+        )
+    else:
+        raise ValueError('Unknown architecture')
+    return model
+
+# Training function
+def train_model(model, criterion, optimizer, num_epochs=10):
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch+1}/{num_epochs}')
+        print('-'*10)
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                    loss = criterion(outputs, labels)
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+            history[f'{phase}_loss'].append(epoch_loss)
+            history[f'{phase}_acc'].append(epoch_acc.item())
+
+            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+
+
+
+    return model, history
+
+# Function to create accuracy and loss plots
+def plot_history(history, title_suffix=""):
+    epochs = range(1, len(history['train_loss'])+1)
+
+    plt.figure(figsize=(12,5))
+
+    plt.subplot(1,2,1)
+    plt.plot(epochs, history['train_loss'], label='Train Loss')
+    plt.plot(epochs, history['val_loss'], label='Val Loss')
+    plt.title('Loss ' + title_suffix)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.subplot(1,2,2)
+    plt.plot(epochs, history['train_acc'], label='Train Acc')
+    plt.plot(epochs, history['val_acc'], label='Val Acc')
+    plt.title('Accuracy ' + title_suffix)
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+
+    plt.show()
+
+# Experiment
+experiments = [
+    #{'arch': 'SimpleCNN', 'lr': 0.001, 'optimizer': 'adam', 'batch_size': 32}, # experimenting with different parameters, commenting out ones we just tried for comparison
+    {'arch': 'SimpleCNN', 'lr': 0.0005, 'optimizer': 'adam', 'batch_size': 32},
+    #{'arch': 'ResNet18', 'lr': 0.001, 'optimizer': 'sgd', 'batch_size': 32},
+    {'arch': 'ResNet18', 'lr': 0.0001, 'optimizer': 'adam', 'batch_size': 32}
+]
+
+for exp in experiments:
+    print(f"\nRunning experiment: {exp}")
+
+    # Updating batch size if different
+    dataloaders['train'] = DataLoader(train_dataset, batch_size=exp['batch_size'], shuffle=True, num_workers=0)
+    dataloaders['val'] = DataLoader(val_dataset, batch_size=exp['batch_size'], shuffle=False, num_workers=0)
+
+    # Initializing model
+    model = initialize_model(exp['arch'], num_classes).to(device)
+
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    if exp['optimizer'] == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=exp['lr'], weight_decay=1e-4)
+    elif exp['optimizer'] == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=exp['lr'], momentum=0.9)
+    else:
+        raise ValueError('Unknown optimizer')
+
+    # Training
+    model, history = train_model(model, criterion, optimizer, num_epochs=20)
+
+    # Making plots
+    plot_history(history, title_suffix=f"{exp['arch']} lr={exp['lr']} opt={exp['optimizer']}")
